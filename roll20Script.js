@@ -1,61 +1,142 @@
-// MAP OBJECT STRUCTURES
+// REPLACE AVERAGE DAMAGE WITH [[ROLL]]
 on('ready', () => {
-    // Retrieve the first NPC character in the list
-    const firstNPC = findObjs({ type: 'character' }).filter(c => getAttrByName(c.id, 'npc') === '1')[0];
-    
-    // Retrieve all attributes belonging to the `firstNPC`
-    const npcAttributes = findObjs({ type: 'attribute', characterid: firstNPC.id });
-
-    // Use `_.omit` to exclude problematic fields that require callbacks
-    const excludedKeys = ['bio', 'gmnotes', '_defaulttoken'];
-
-    // Create a new mapped object for the character properties
-    const mappedCharacter = _.mapObject(_.omit(firstNPC.attributes, excludedKeys), (value) => {
-        return Array.isArray(value) ? 'array' :
-               typeof value === 'object' ? 'object' :
-               typeof value;
-    });
-
-    // Create a mapped object for the attributes of the NPC character
-    const mappedAttr = _.reduce(npcAttributes, (result, attr) => {
-        result[attr.get('name')] = typeof attr.get('current'); // Map each attribute name to its type
-        return result;
-    }, {});
-
-    // Convert to clean JSON object literals with the correct structure
-    const characterJSON = JSON.stringify(mappedCharacter, null, 2); // `null, 2` adds indentation for readability
-    const attrJSON = JSON.stringify(mappedAttr, null, 2); // `null, 2` adds indentation for readability
-
-    // Log the structures for inspection
-    log('Character Structure');
-    log(characterJSON);
-    log('Attribute Structure');
-    log(attrJSON);
-});
-
-// CACHE CHARACTER & ATTRIBUTE DATA
-on('ready', () => {
-    // state.npcList = {};
-    let updatedNum = 0;
-    state.npcList = state.npcList || {};
-    const npcs = [...findObjs({ type: 'character' }).filter(c => getAttrByName(c.id, 'npc') === '1')];
+    let cnt = 0;
+    const npcs = findObjs({ _type: 'character' }).filter(c => getAttrByName(c.id, 'npc') === '1');
     npcs.forEach(npc => {
-        if (!state.npcList[npc.id]) {
-            npc.linkedAttr = findObjs({ type: 'attribute', characterid: npc.id });
-            state.npcList[npc.id] = npc;
-            updatedNum++;
-        }
+        findObjs({_type: 'attribute', _characterid: npc.id}).filter(attr => /^repeating_.*_description$/.test(attr.get('name'))).forEach(attr => {
+            let desc = attr.get('current');
+            desc = desc.replace(/(\d+) \((\d{1,2}d\d{1,2})\)/g, (match, number, dice) => `${number} [[${dice}]]`);
+            attr.set('current', desc);
+            cnt ++;
+            log('updated ' + cnt);
+        })
+        
     });
-    log(`npcList length: ${Object.keys(state.npcList).length}`);
-    log(`npcs updated: ${updatedNum}`);
+});
+
+// CREATE ABILITIES FOR REPEATING ACTIONS
+on('ready', () => {
+    log("Script to create abilities for all repeating action types started...");
+
+    // Define patterns for repeating sections and their corresponding attribute suffixes
+    const repeatingSectionDetails = {
+        "repeating_npcaction": "npc_action",           // NPC Actions
+        "repeating_spell-cantrip": "spell",            // Cantrip Spells
+        "repeating_spell-[0-9]+": "spell",             // All spell levels (1-9)
+        "repeating_attack": "attack",                  // Attacks (use _attack attribute)
+        "repeating_npcreaction": "npc_action",         // NPC Reactions
+        "repeating_npcaction-l": "npc_action"          // Additional custom actions (e.g., legendary actions)
+    };
+
+    // Build regex patterns based on the keys in repeatingSectionDetails
+    const repeatingSectionPatterns = Object.keys(repeatingSectionDetails).map(section => new RegExp(`^${section}_`, 'i'));
+
+    // Find all NPC characters in the game
+    const npcs = findObjs({ _type: 'character' }).filter(c => getAttrByName(c.id, 'npc') === '1');
+
+    npcs.forEach(npc => {
+        // Track how many abilities we add for this NPC
+        let abilitiesAdded = 0;
+
+        // Find all existing abilities for this NPC to avoid duplicates
+        let existingAbilities = findObjs({ _type: 'ability', _characterid: npc.id }).map(a => a.get('name'));
+
+        // Find all attributes for the current NPC
+        let attributes = findObjs({ _type: 'attribute', _characterid: npc.id });
+
+        // Iterate through each attribute and check against defined patterns
+        attributes.forEach(attr => {
+            // Check if the attribute matches any of the defined repeating patterns
+            let patternMatch = repeatingSectionPatterns.find(pattern => pattern.test(attr.get('name')));
+
+            if (patternMatch && attr.get('name').endsWith('_name')) {
+                // The attribute follows the repeating section structure: repeating_<section>_<id>_name
+                let attrParts = attr.get('name').split('_');
+
+                // Ensure the attribute name has at least 4 parts: "repeating", "<section>", "-row_id", "name"
+                if (attrParts.length < 4) {
+                    log(`Skipping malformed attribute name: ${attr.get('name')}`);
+                    return;
+                }
+
+                let section = attrParts[0] + "_" + attrParts[1]; // Combine the section name and level/type (e.g., repeating_spell-1)
+                let rowId = attrParts[2]; // Extract the row ID (e.g., -abcdefghijkl)
+                
+                // Confirm that the rowId is correctly formed
+                if (!rowId.startsWith("-")) {
+                    log(`Invalid row ID for attribute: ${attr.get('name')} in NPC: ${npc.get('name')}`);
+                    return;
+                }
+
+                // Determine the correct attribute suffix based on the section name
+                let sectionBase = section.split("_")[0] + (section.split("_")[1] ? "-" + section.split("_")[1] : "");
+                let attributeSuffix = repeatingSectionDetails[sectionBase] || "action"; // Default to "action" if not found
+
+                let actionName = attr.get('current'); // Get the action name (e.g., "Slam")
+                let abilityName = actionName; // Use the value as the ability name
+
+                if (existingAbilities.includes(abilityName)) {
+                    findObjs({_type: 'ability', _characterid: npc.id, name: abilityName})[0].remove();
+                    existingAbilities = existingAbilities.filter(a => a !== abilityName);
+                    log('action removed');
+                }
+                if (!existingAbilities.includes(abilityName)) {
+                    // Construct the full macro path using character ID, section, row ID, and attribute suffix
+                    let actionReference = `%{${npc.id}|${section}_${rowId}_npc_action}`;
+
+                    log(`Constructed Action Reference: ${actionReference}`);
+
+                    // Create a macro button to call the repeating action using the correct format
+                    createObj('ability', {
+                        name: abilityName,
+                        characterid: npc.id,
+                        action: actionReference,  // Use constructed actionReference with character ID and formatted action
+                        istokenaction: true
+                    });
+
+                    log(`Created ability '${abilityName}' for NPC: ${npc.get('name')}`);
+                    abilitiesAdded++;
+                } else {
+                    log(`Ability '${abilityName}' already exists for NPC: ${npc.get('name')}. Skipping creation.`);
+                }
+            }
+        });
+
+        log(`NPC: ${npc.get('name')} - Total abilities added: ${abilitiesAdded}`);
+    });
+
+    log("Script to create abilities for all repeating action types completed.");
+});
+
+// INFO
+on('ready', () => {
+    // The target row ID and character ID
+    const characterId = "-O8FBwK08dm3RTA3RsKH"; // Replace with the character ID
+    const targetRowId = "repeating_npcaction_-O8FBwf0pYJcvKk0ROnF"; // Replace with the row ID
+
+    // Find the character using its unique character ID
+    let npc = getObj('character', characterId);
+
+    if (npc) {
+        // Find all attributes for this character
+        let attributes = findObjs({ _type: 'attribute', _characterid: npc.id }).sort((a, b) => a.get('name').localeCompare(b.get('name')));
+
+        // Use `filter` and a regex pattern to find attributes that contain the target row ID
+        let matchingAttributes = attributes.filter(attr => attr.get('name').includes(targetRowId));
+
+        // Log all matching attributes
+        log(`Attributes for row ID ${targetRowId}:`);
+        matchingAttributes.forEach(attr => {
+            log(`${attr.get('name')} = ${attr.get('current')}`);
+        });
+    } else {
+        log(`Character with ID '${characterId}' not found.`);
+    }
 });
 
 
-
-
-/*
-NOTES ON ROLL20 OBJECT STRUCTURES
-1. attribute Object
+{ /* NOTES ON ROLL20 OBJECT STRUCTURES*/
+/* attribute Object
 An attribute object usually represents a single character attribute, such as hit points, armor class, or spell slots.
 
 Encapsulated Attributes:
@@ -71,7 +152,9 @@ Copy code
 attr.get('name');
 attr.get('current');
 attr.get('characterid');
-2. character Object
+*/
+
+/* character Object
 The character object represents a full character sheet, including attributes, abilities, and other metadata.
 
 Encapsulated Attributes:
@@ -91,7 +174,9 @@ Copy code
 character.get('name');
 character.get('controlledby');
 character.get('defaulttoken');
-3. ability Object
+*/
+
+/* ability Object
 Represents a macro or ability tied to a specific character.
 
 Encapsulated Attributes:
@@ -107,7 +192,9 @@ javascript
 Copy code
 ability.get('name');
 ability.get('action');
-4. graphic Object
+*/
+
+/* graphic Object
 Represents any graphic object on the tabletop, including tokens, map elements, and decorations.
 
 Encapsulated Attributes:
@@ -130,7 +217,9 @@ Copy code
 graphic.get('left');
 graphic.get('layer');
 graphic.get('statusmarkers');
-5. text Object
+*/
+
+/* text Object
 Represents a text object on the tabletop, typically used for labels or notes.
 
 Encapsulated Attributes:
@@ -149,7 +238,9 @@ javascript
 Copy code
 text.get('text');
 text.get('layer');
-6. page Object
+*/
+
+/* page Object
 Represents a single page in a Roll20 campaign. This includes information like map size, grid configuration, and lighting settings.
 
 Encapsulated Attributes:
@@ -168,9 +259,9 @@ javascript
 Copy code
 page.get('name');
 page.get('width');
-
-
-CHARACTER STRUCTURE
+*/
+}
+/* CHARACTER STRUCTURE
 {
     "name": "string",
     "archived": "boolean",
@@ -180,9 +271,8 @@ CHARACTER STRUCTURE
     "_type": "string",
     "avatar": "string"
   }
-
-
-ATTRIBUTE STRUCTURE
+*/
+/* ATTRIBUTE STRUCTURE
 {
     "version": "string",
     "already_transitioned": "string",
@@ -311,5 +401,388 @@ ATTRIBUTE STRUCTURE
     "repeating_npctrait_-KOpjZgXnynvfoj0WdRv_name": "string",
     "repeating_npctrait_-KOpjZgXnynvfoj0WdRv_desc": "string"
   }
-  
+*/
+// ACTION NAME STRUCTURE: 'repeating_<action type>_-<action id>_<attribute name>'
+/* ATTRIBUTE NAMES ACTION TYPES
+[
+    "repeating_npcaction",
+    "repeating_spell-cantrip",
+    "repeating_attack",
+    "repeating_spell-1",
+    "repeating_spell-2",
+    "repeating_spell-3",
+    "repeating_spell-4",
+    "repeating_spell-5",
+    "repeating_spell-6",
+    "repeating_spell-7",
+    "repeating_spell-8",
+    "repeating_spell-9",
+    "repeating_npcreaction",
+    "repeating_npcaction-l",
+    "repeating_spell-7",
+    "repeating_spell-9"
+]
+*/
+/* ATTRIBUTE NAMES FOR REPEATING TRAITS
+[
+    "atkbonus",
+    "atkflag",
+    "atkname",
+    "atkdmgtype",
+    "atkrange",
+    "details-flag",
+    "desc",
+    "description",
+    "dmg2attr",
+    "dmg2base",
+    "dmg2flag",
+    "dmg2type",
+    "dmgattr",
+    "dmgbase",
+    "dmgflag",
+    "dmgtype",
+    "hldmg",
+    "innate",
+    "name",
+    "options-flag",
+    "rollbase",
+    "rollcontent",
+    "saveattr",
+    "saveeffect",
+    "savedc",
+    "saveflag",
+    "spellathigherlevels",
+    "spellattack",
+    "spellattackid",
+    "spellcastingtime",
+    "spellconcentration",
+    "spelldamage",
+    "spelldamage2",
+    "spelldamagetype",
+    "spelldamagetype2",
+    "spelldescription",
+    "spelledmgmod",
+    "spellhealing",
+    "spellhlbonus",
+    "spellhldie",
+    "spellhldietype",
+    "spellid",
+    "spelllevel",
+    "spellname",
+    "spelloutput",
+    "spellrange",
+    "spellritual",
+    "spellschool",
+    "spellsave",
+    "spellsavesuccess",
+    "spelltarget",
+    "spellduration",
+    "spelldmgmod",
+    "updateflag"
+]
+
+*/
+/* ATTRIBUTE NAMES BY ACTION TYPE
+{
+  "attributes": {
+    "attack": [
+      "atkbonus",
+      "atkflag",
+      "atkname",
+      "atkdmgtype",
+      "atkrange",
+      "dmg2attr",
+      "dmg2base",
+      "dmg2flag",
+      "dmg2type",
+      "dmgattr",
+      "dmgbase",
+      "dmgflag",
+      "dmgtype",
+      "hldmg",
+      "options-flag",
+      "rollbase",
+      "saveattr",
+      "saveeffect",
+      "savedc",
+      "saveflag",
+      "spellid",
+      "spelllevel"
+    ],
+    "npcaction": [
+      "description",
+      "name",
+      "rollbase",
+      "updateflag"
+    ],
+    "npcaction-l": [
+      "description",
+      "name",
+      "rollbase",
+      "updateflag"
+    ],
+    "npcreaction": [
+      "desc",
+      "description",
+      "name"
+    ],
+    "spell-1": [
+      "details-flag",
+      "innate",
+      "options-flag",
+      "rollcontent",
+      "spelldamage",
+      "spelldamage2",
+      "spelldamagetype",
+      "spelldamagetype2",
+      "spelldescription",
+      "spelldmgmod",
+      "spellduration",
+      "spellathigherlevels",
+      "spellattack",
+      "spellattackid",
+      "spellcastingtime",
+      "spellconcentration",
+      "spellhealing",
+      "spellhlbonus",
+      "spellhldie",
+      "spellhldietype",
+      "spelllevel",
+      "spellname",
+      "spelloutput",
+      "spellrange",
+      "spellritual",
+      "spellschool",
+      "spellsave",
+      "spellsavesuccess",
+      "spelltarget"
+    ],
+    "spell-2": [
+      "details-flag",
+      "innate",
+      "options-flag",
+      "rollcontent",
+      "spelldamage",
+      "spelldamage2",
+      "spelldamagetype",
+      "spelldamagetype2",
+      "spelldescription",
+      "spelldmgmod",
+      "spellduration",
+      "spellathigherlevels",
+      "spellattack",
+      "spellattackid",
+      "spellcastingtime",
+      "spellconcentration",
+      "spellhealing",
+      "spellhldie",
+      "spellhldietype",
+      "spelllevel",
+      "spellname",
+      "spelloutput",
+      "spellrange",
+      "spellritual",
+      "spellschool",
+      "spellsave",
+      "spellsavesuccess",
+      "spelltarget"
+    ],
+    "spell-3": [
+      "details-flag",
+      "innate",
+      "options-flag",
+      "rollcontent",
+      "spelldamage",
+      "spelldamage2",
+      "spelldamagetype",
+      "spelldamagetype2",
+      "spelldescription",
+      "spellduration",
+      "spellathigherlevels",
+      "spellattackid",
+      "spellcastingtime",
+      "spellconcentration",
+      "spellhldie",
+      "spellhldietype",
+      "spelllevel",
+      "spellname",
+      "spelloutput",
+      "spellrange",
+      "spellritual",
+      "spellschool",
+      "spellsave",
+      "spellsavesuccess",
+      "spelltarget"
+    ],
+    "spell-4": [
+      "details-flag",
+      "innate",
+      "options-flag",
+      "rollcontent",
+      "spelldamage",
+      "spelldamage2",
+      "spelldamagetype",
+      "spelldamagetype2",
+      "spelldescription",
+      "spellduration",
+      "spellathigherlevels",
+      "spellattackid",
+      "spellcastingtime",
+      "spellconcentration",
+      "spellhldie",
+      "spellhldietype",
+      "spelllevel",
+      "spellname",
+      "spelloutput",
+      "spellrange",
+      "spellritual",
+      "spellschool",
+      "spellsave",
+      "spellsavesuccess",
+      "spelltarget"
+    ],
+    "spell-5": [
+      "details-flag",
+      "innate",
+      "options-flag",
+      "rollcontent",
+      "spelldamage",
+      "spelldamage2",
+      "spelldamagetype",
+      "spelldamagetype2",
+      "spelldescription",
+      "spellduration",
+      "spellathigherlevels",
+      "spellattackid",
+      "spellcastingtime",
+      "spellconcentration",
+      "spellhldie",
+      "spellhldietype",
+      "spelllevel",
+      "spellname",
+      "spelloutput",
+      "spellrange",
+      "spellritual",
+      "spellschool",
+      "spellsave",
+      "spellsavesuccess",
+      "spelltarget"
+    ],
+    "spell-6": [
+      "details-flag",
+      "innate",
+      "options-flag",
+      "rollcontent",
+      "spelldamage",
+      "spelldamage2",
+      "spelldamagetype",
+      "spelldamagetype2",
+      "spelldescription",
+      "spellduration",
+      "spellathigherlevels",
+      "spellattackid",
+      "spellcastingtime",
+      "spellconcentration",
+      "spellhldie",
+      "spellhldietype",
+      "spelllevel",
+      "spellname",
+      "spelloutput",
+      "spellrange",
+      "spellritual",
+      "spellschool",
+      "spellsave",
+      "spellsavesuccess",
+      "spelltarget"
+    ],
+    "spell-7": [
+      "details-flag",
+      "innate",
+      "options-flag",
+      "rollcontent",
+      "spelldamage",
+      "spelldamage2",
+      "spelldamagetype",
+      "spelldamagetype2",
+      "spelldescription",
+      "spellduration",
+      "spellathigherlevels",
+      "spellattack",
+      "spellattackid",
+      "spellcastingtime",
+      "spellconcentration",
+      "spellhldie",
+      "spellhldietype",
+      "spelllevel",
+      "spellname",
+      "spelloutput",
+      "spellrange",
+      "spellschool",
+      "spellsave",
+      "spellsavesuccess",
+      "spelltarget"
+    ],
+    "spell-8": [
+      "details-flag",
+      "innate",
+      "options-flag",
+      "rollcontent",
+      "spelldamage",
+      "spelldamage2",
+      "spelldamagetype",
+      "spelldamagetype2",
+      "spelldescription",
+      "spellduration",
+      "spellattackid",
+      "spellcastingtime",
+      "spellconcentration",
+      "spelllevel",
+      "spellname",
+      "spelloutput",
+      "spellrange",
+      "spellschool",
+      "spellsave",
+      "spellsavesuccess",
+      "spelltarget"
+    ],
+    "spell-9": [
+      "details-flag",
+      "innate",
+      "options-flag",
+      "spelldescription",
+      "spellduration",
+      "spellcastingtime",
+      "spelllevel",
+      "spellname",
+      "spellrange",
+      "spellschool",
+      "spelltarget"
+    ],
+    "spell-cantrip": [
+      "details-flag",
+      "innate",
+      "options-flag",
+      "rollcontent",
+      "spelldamage",
+      "spelldamage2",
+      "spelldamagetype",
+      "spelldamagetype2",
+      "spelldescription",
+      "spellduration",
+      "spellattack",
+      "spellattackid",
+      "spellcastingtime",
+      "spellconcentration",
+      "spelllevel",
+      "spellname",
+      "spelloutput",
+      "spellrange",
+      "spellritual",
+      "spellschool",
+      "spellsave",
+      "spellsavesuccess",
+      "spelltarget"
+    ]
+  }
+}
 */
